@@ -849,7 +849,7 @@ HTML_TEMPLATE = """
                                 <span class="streak-badge" style="margin: 0;">{{ p.streak_emoji }}</span>
                                 {% endif %}
                                 {% if p.total < 5 %}
-                                <span class="placement-badge">PROBACIÓN {{p.total}}/5</span>
+                                <span class="placement-badge">PLACEMENT {{p.total}}/5</span>
                                 {% endif %}
                             </td>
                             <td><strong>{{ p.elo }}</strong></td>
