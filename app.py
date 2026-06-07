@@ -6,11 +6,10 @@ from flask import Flask, render_template_string, request, redirect, url_for, jso
 
 app = Flask(__name__)
 
-# URL da base de dados PostgreSQL que criaste no Render
+# URL de la base de datos PostgreSQL en Render
 DATABASE_URL = "postgresql://voley_db_user:hgsylU2ATGZ41Xv90Mwm6J0BMPLqxWEz@dpg-d8ic4veq1p3s73eif0c0-a/voley_db"
 
 def get_db_connection():
-    # Ligação ao PostgreSQL utilizando a URL do Render
     conn = psycopg2.connect(DATABASE_URL)
     return conn
 
@@ -18,10 +17,8 @@ def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
     
-    # No PostgreSQL alteramos INTEGER PRIMARY KEY AUTOINCREMENT para SERIAL PRIMARY KEY
     cur.execute('''
-        CREATE TABLE IF NOT EXISTS players (
-            id SERIAL PRIMARY KEY,
+        CREATE TABLE IF NOT EXISTS players (\n            id SERIAL PRIMARY KEY,
             name TEXT UNIQUE NOT NULL,
             elo REAL DEFAULT 1200
         )
@@ -55,14 +52,12 @@ def init_db():
         )
     ''')
     
-    # Verificar se a coluna elo_change existe na tabela match_players
     try:
         cur.execute("SELECT elo_change FROM match_players LIMIT 1")
     except psycopg2.Error:
         conn.rollback()
         cur.execute("ALTER TABLE match_players ADD COLUMN elo_change REAL DEFAULT 0")
 
-    # Inserir histórico inicial para jogadores existentes que não o tenham
     cur.execute("SELECT id, elo FROM players")
     existing_players = cur.fetchall()
     for p in existing_players:
@@ -179,7 +174,6 @@ def process_match_elo(conn, match_id, team_a_ids, team_b_ids, score_a, score_b, 
             else:             
                 disparidad_mult_a = max(0.5, 1.0 - factor_escala)
 
-    # Processar Equipa A
     for p_id in team_a_ids:
         cur.execute('SELECT elo FROM players WHERE id = %s', (p_id,))
         p_elo = cur.fetchone()['elo']
@@ -215,7 +209,6 @@ def process_match_elo(conn, match_id, team_a_ids, team_b_ids, score_a, score_b, 
         new_elo = cur.fetchone()['elo']
         cur.execute('INSERT INTO elo_history (player_id, elo_snapshot) VALUES (%s, %s)', (p_id, new_elo))
         
-    # Processar Equipa B
     for p_id in team_b_ids:
         cur.execute('SELECT elo FROM players WHERE id = %s', (p_id,))
         p_elo = cur.fetchone()['elo']
@@ -414,7 +407,6 @@ def index():
         elif m['sun_advantage'] == 'B':
             sun_emoji = "☀️ Sol en contra: Equipo A"
 
-        # Formatar data para exibição simples (AAAA-MM-DD)
         date_str = m['date'].strftime('%Y-%m-%d') if hasattr(m['date'], 'strftime') else str(m['date']).split()[0]
 
         match_history.append({
@@ -648,7 +640,7 @@ def edit_match(match_id):
 
 
 # =========================================================
-# NOVAS RUTAS DE BACKUP (JSON MIGRATION PLAN)
+# RUTAS DE BACKUP (JSON MIGRATION PLAN)
 # =========================================================
 @app.route('/download_backup')
 def download_backup():
@@ -656,11 +648,9 @@ def download_backup():
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
         
-        # 1. Obter Jogadores
         cur.execute("SELECT id, name, elo FROM players")
         players = [dict(row) for row in cur.fetchall()]
         
-        # 2. Obter Partidos (formatando timestatmp para texto ISO)
         cur.execute("SELECT id, score_a, score_b, sun_advantage, date FROM matches")
         matches = []
         for row in cur.fetchall():
@@ -671,7 +661,6 @@ def download_backup():
                 d['date'] = str(d['date'])
             matches.append(d)
             
-        # 3. Obter Histórico de Pontuação ELO
         cur.execute("SELECT id, player_id, elo_snapshot, date FROM elo_history")
         elo_history = []
         for row in cur.fetchall():
@@ -682,7 +671,6 @@ def download_backup():
                 d['date'] = str(d['date'])
             elo_history.append(d)
             
-        # 4. Obter Relacionamento de Jogadores por Partido
         cur.execute("SELECT match_id, player_id, team, elo_change FROM match_players")
         match_players = [dict(row) for row in cur.fetchall()]
         
@@ -720,29 +708,23 @@ def restore_backup():
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # Limpar tabelas por completo e reiniciar contadores
         cur.execute("TRUNCATE match_players, elo_history, matches, players RESTART IDENTITY CASCADE;")
         
-        # 1. Inserir Jogadores
         for p in backup_data.get('players', []):
             cur.execute("INSERT INTO players (id, name, elo) VALUES (%s, %s, %s)", (p['id'], p['name'], p['elo']))
             
-        # 2. Inserir Partidos
         for m in backup_data.get('matches', []):
             cur.execute("INSERT INTO matches (id, score_a, score_b, sun_advantage, date) VALUES (%s, %s, %s, %s, %s)", 
                         (m['id'], m['score_a'], m['score_b'], m['sun_advantage'], m['date']))
             
-        # 3. Inserir Relações de Jogadores
         for mp in backup_data.get('match_players', []):
             cur.execute("INSERT INTO match_players (match_id, player_id, team, elo_change) VALUES (%s, %s, %s, %s)", 
                         (mp['match_id'], mp['player_id'], mp['team'], mp['elo_change']))
             
-        # 4. Inserir Histórico Snapshots
         for eh in backup_data.get('elo_history', []):
             cur.execute("INSERT INTO elo_history (id, player_id, elo_snapshot, date) VALUES (%s, %s, %s, %s)", 
                         (eh['id'], eh['player_id'], eh['elo_snapshot'], eh['date']))
             
-        # Sincronizar sequências numéricas automáticas do Postgres para não colidir no futuro
         cur.execute("SELECT setval('players_id_seq', COALESCE((SELECT MAX(id) FROM players), 1))")
         cur.execute("SELECT setval('matches_id_seq', COALESCE((SELECT MAX(id) FROM matches), 1))")
         cur.execute("SELECT setval('elo_history_id_seq', COALESCE((SELECT MAX(id) FROM elo_history), 1))")
@@ -757,7 +739,7 @@ def restore_backup():
 
 
 # ---------------------------------------------------------
-# 4. INTERFAZ EN HTML INTEGRADA (CON SECCIÓN DE BACKUP)
+# 4. INTERFAZ EN HTML INTEGRADA
 # ---------------------------------------------------------
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -839,7 +821,7 @@ HTML_TEMPLATE = """
             <a onclick="showTab('ranking', this)" class="active-tab">🏆 Ránking y Métricas</a>
             <a onclick="showTab('add_match', this)">📝 Añadir Resultado</a>
             <a onclick="showTab('history', this)">📖 Historial de Partidos</a>
-            <a onclick="showTab('players', this)">👥 Gestión de Jugadores</a>
+            <a onclick="showTab('players', this)">👥 Gestión</a>
         </nav>
 
         <section id="ranking" class="tab-content active">
@@ -936,7 +918,7 @@ HTML_TEMPLATE = """
                         <tr onclick="openMatchDetail({{ h.id }})" style="cursor: pointer;" title="Hacé click para ver detalles">
                             <td><small>{{ h.date }}</small></td>
                             <td style="color: #d81b60;">{{ h.team_a }}</td>
-                            <td><strong>{{ h.score_a }} - { { h.score_b } }</strong></td>
+                            <td><strong>{{ h.score_a }} - {{ h.score_b }}</strong></td>
                             <td style="color: #1e88e5;">{{ h.team_b }}</td>
                             <td>{{ h.sun }}</td>
                         </tr>
@@ -970,25 +952,25 @@ HTML_TEMPLATE = """
                     </form>
                 </article>
             </div>
-        </section>
 
-        <div style="margin: 30px auto; padding: 20px; border: 1px solid #1095c1; border-radius: 8px; background-color: #f4fafd; font-family: sans-serif;">
-            <h3 style="color: #1095c1; margin-top: 0; font-size: 18px;">Gestión de Datos (Plan Gratuito Render)</h3>
-            <p style="font-size: 13px; color: #555; line-height: 1.4; margin-bottom: 15px;">
-                As bases de dados gratuitas expiram ao fim de 30 dias. Descarrega a tua cópia de segurança antes de <strong>7 de Julho de 2026</strong>. Quando criares uma nova base de dados no próximo mês, arrasta o ficheiro JSON aqui para restaurar todo o histórico.
-            </p>
-            <div style="display: flex; flex-wrap: wrap; gap: 20px; align-items: center;">
-                <a href="/download_backup" style="background-color: #1095c1; color: white; padding: 10px 18px; text-decoration: none; border-radius: 4px; font-weight: bold; font-size: 14px; display: inline-block;">
-                    📥 Descargar Copia Actual (JSON)
-                </a>
-                <form action="/restore_backup" method="POST" enctype="multipart/form-data" style="display: flex; align-items: center; gap: 10px; margin: 0;">
-                    <input type="file" id="backup_file" name="backup_file" accept=".json" required style="font-size: 13px; border: 1px dashed #1095c1; padding: 5px; border-radius: 4px; background: white;">
-                    <button type="submit" onclick="return confirm('¿Estás seguro? Esto reemplazará todos los datos de la base de datos actual.')" style="background-color: #e67e22; color: white; padding: 10px 15px; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; font-size: 14px; width: auto; margin:0;">
-                        📤 Restaurar Datos
-                    </button>
-                </form>
+            <div style="margin: 30px auto 0 auto; padding: 20px; border: 1px solid #1095c1; border-radius: 8px; background-color: #f4fafd; font-family: sans-serif;">
+                <h3 style="color: #1095c1; margin-top: 0; font-size: 18px;">Gestión de Datos (Plan Gratuito Render)</h3>
+                <p style="font-size: 13px; color: #555; line-height: 1.4; margin-bottom: 15px;">
+                    Las bases de datos gratuitas vencen a los 30 días. Descarga tu copia de seguridad antes del <strong>7 de julio de 2026</strong>. Cuando crees una nueva base de datos el próximo mes, sube el archivo JSON aquí para restaurar todo el historial.
+                </p>
+                <div style="display: flex; flex-wrap: wrap; gap: 20px; align-items: center;">
+                    <a href="/download_backup" style="background-color: #1095c1; color: white; padding: 10px 18px; text-decoration: none; border-radius: 4px; font-weight: bold; font-size: 14px; display: inline-block;">
+                        📥 Descargar Copia Actual (JSON)
+                    </a>
+                    <form action="/restore_backup" method="POST" enctype="multipart/form-data" style="display: flex; align-items: center; gap: 10px; margin: 0;">
+                        <input type="file" id="backup_file" name="backup_file" accept=".json" required style="font-size: 13px; border: 1px dashed #1095c1; padding: 5px; border-radius: 4px; background: white;">
+                        <button type="submit" onclick="return confirm('¿Estás seguro? Esto reemplazará todos los datos de la base de datos actual.')" style="background-color: #e67e22; color: white; padding: 10px 15px; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; font-size: 14px; width: auto; margin:0;">
+                            📤 Restaurar Datos
+                        </button>
+                    </form>
+                </div>
             </div>
-        </div>
+        </section>
 
     </main>
 
@@ -1335,6 +1317,5 @@ HTML_TEMPLATE = """
 
 if __name__ == '__main__':
     init_db()
-    # No Render lê-se a porta atribuída pelo sistema
     port = int(os.environ.get("PORT", 5000))
     app.run(debug=True, host='0.0.0.0', port=port)
