@@ -521,7 +521,7 @@ def player_profile(player_id):
 
     cur.execute('SELECT elo_snapshot FROM elo_history WHERE player_id = %s ORDER BY date ASC', (player_id,))
     elo_snaps = cur.fetchall()
-    chart_data = [1200] + [row['elo_snapshot'] for row in elo_snaps]
+    chart_data = [row['elo_snapshot'] for row in elo_snaps]
 
     cur.close()
     conn.close()
