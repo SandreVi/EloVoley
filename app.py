@@ -653,6 +653,15 @@ def edit_match(match_id):
     conn.close()
     return redirect(url_for('index'))
 
+@app.route('/recalculate_elos', methods=['POST'])
+def trigger_recalculate():
+    conn = get_db_connection()
+    # Ejecuta tu función existente que borra y recalcula todo el historial
+    recalculate_all_elos(conn) 
+    conn.commit()
+    conn.close()
+    return redirect(url_for('index'))
+
 # ---------------------------------------------------------
 # RUTAS DE RESPALDO Y RESTAURACIÓN (MIGRACIÓN MENSUAL)
 # ---------------------------------------------------------
@@ -802,6 +811,12 @@ HTML_TEMPLATE = """
         </nav>
 
         <section id="ranking" class="tab-content active">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                <h2 style="margin: 0;">Clasificación General</h2>
+                <form action="/recalculate_elos" method="POST" style="margin: 0;" onsubmit="return confirm('¿Seguro que quieres recalcular el ELO de toda la base de datos desde el principio? Esto reconstruirá el historial basándose en las fórmulas actuales.');">
+                    <button type="submit" class="secondary" style="padding: 5px 15px; font-size: 0.85rem; width: auto; margin: 0;">🔄 Recalcular Todos los ELOs</button>
+                </form>
+            </div>
             <h2>Clasificación General</h2>
             <figure>
                 <table role="grid" id="leaderboardTable">
