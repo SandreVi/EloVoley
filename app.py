@@ -1,89 +1,87 @@
 import os
-import json
 import psycopg2
-import psycopg2.extras
+from psycopg2.extras import DictCursor
+import json
 from flask import Flask, render_template_string, request, redirect, url_for, jsonify, Response
 
 app = Flask(__name__)
 
-# URL de la base de datos PostgreSQL en Render
-DATABASE_URL = "postgresql://voley_db_user:hgsylU2ATGZ41Xv90Mwm6J0BMPLqxWEz@dpg-d8ic4veq1p3s73eif0c0-a/voley_db"
+# Render proporciona automáticamente la variable DATABASE_URL al enlazar una base de datos Postgres
+DATABASE_URL = os.environ.get('DATABASE_URL', 'postgresql://voley_db_user:hgsylU2ATGZ41Xv90Mwm6J0BMPLqxWEz@dpg-d8ic4veq1p3s73eif0c0-a/voley_db')
 
+# ---------------------------------------------------------
+# 1. BASE DE DATOS E INICIALIZACIÓN (POSTGRESQL)
+# ---------------------------------------------------------
 def get_db_connection():
-    conn = psycopg2.connect(DATABASE_URL)
+    # Usamos DictCursor para poder seguir accediendo a las columnas por nombre: row['name']
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=DictCursor)
     return conn
 
 def init_db():
     conn = get_db_connection()
-    cur = conn.cursor()
-    
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS players (\n            id SERIAL PRIMARY KEY,
-            name TEXT UNIQUE NOT NULL,
-            elo REAL DEFAULT 1200
-        )
-    ''')
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS matches (
-            id SERIAL PRIMARY KEY,
-            score_a INTEGER NOT NULL,
-            score_b INTEGER NOT NULL,
-            sun_advantage TEXT CHECK(sun_advantage IN ('A', 'B', 'None')) DEFAULT 'None',
-            date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS match_players (
-            match_id INTEGER,
-            player_id INTEGER,
-            team TEXT CHECK(team IN ('A', 'B')),
-            elo_change REAL DEFAULT 0,
-            FOREIGN KEY(match_id) REFERENCES matches(id) ON DELETE CASCADE,
-            FOREIGN KEY(player_id) REFERENCES players(id) ON DELETE CASCADE
-        )
-    ''')
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS elo_history (
-            id SERIAL PRIMARY KEY,
-            player_id INTEGER,
-            elo_snapshot REAL,
-            date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(player_id) REFERENCES players(id) ON DELETE CASCADE
-        )
-    ''')
-    
-    try:
-        cur.execute("SELECT elo_change FROM match_players LIMIT 1")
-    except psycopg2.Error:
-        conn.rollback()
-        cur.execute("ALTER TABLE match_players ADD COLUMN elo_change REAL DEFAULT 0")
-
-    cur.execute("SELECT id, elo FROM players")
-    existing_players = cur.fetchall()
-    for p in existing_players:
-        p_id, p_elo = p[0], p[1]
-        cur.execute("SELECT 1 FROM elo_history WHERE player_id = %s", (p_id,))
-        if not cur.fetchone():
-            cur.execute("INSERT INTO elo_history (player_id, elo_snapshot) VALUES (%s, %s)", (p_id, p_elo))
-            
-    conn.commit()
-    cur.close()
+    with conn.cursor() as cur:
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS players (
+                id SERIAL PRIMARY KEY,
+                name TEXT UNIQUE NOT NULL,
+                elo REAL DEFAULT 1200
+            )
+        ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS matches (
+                id SERIAL PRIMARY KEY,
+                score_a INTEGER NOT NULL,
+                score_b INTEGER NOT NULL,
+                sun_advantage TEXT CHECK(sun_advantage IN ('A', 'B', 'None')) DEFAULT 'None',
+                date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS match_players (
+                match_id INTEGER,
+                player_id INTEGER,
+                team TEXT CHECK(team IN ('A', 'B')),
+                elo_change REAL DEFAULT 0,
+                FOREIGN KEY(match_id) REFERENCES matches(id) ON DELETE CASCADE,
+                FOREIGN KEY(player_id) REFERENCES players(id) ON DELETE CASCADE
+            )
+        ''')
+        
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS elo_history (
+                id SERIAL PRIMARY KEY,
+                player_id INTEGER,
+                elo_snapshot REAL,
+                date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(player_id) REFERENCES players(id) ON DELETE CASCADE
+            )
+        ''')
+        
+        cur.execute("SELECT id, elo FROM players")
+        existing_players = cur.fetchall()
+        for p in existing_players:
+            cur.execute("SELECT 1 FROM elo_history WHERE player_id = %s", (p['id'],))
+            has_history = cur.fetchone()
+            if not has_history:
+                cur.execute("INSERT INTO elo_history (player_id, elo_snapshot) VALUES (%s, %s)", (p['id'], p['elo']))
+                
+        conn.commit()
     conn.close()
 
 # ---------------------------------------------------------
 # 2. LÓGICA DE CÁLCULO ELO Y ESTADÍSTICAS
 # ---------------------------------------------------------
 def get_current_streak(player_id, conn):
-    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-    cur.execute('''
-        SELECT m.score_a, m.score_b, mp.team 
-        FROM match_players mp
-        JOIN matches m ON mp.match_id = m.id
-        WHERE mp.player_id = %s
-        ORDER BY m.date DESC, m.id DESC
-    ''', (player_id,))
-    rows = cur.fetchall()
-    cur.close()
+    """Calcula la racha actual (victorias o derrotas consecutivas) de un jugador"""
+    with conn.cursor() as cur:
+        cur.execute('''
+            SELECT m.score_a, m.score_b, mp.team 
+            FROM match_players mp
+            JOIN matches m ON mp.match_id = m.id
+            WHERE mp.player_id = %s
+            ORDER BY m.date DESC, m.id DESC
+        ''', (player_id,))
+        rows = cur.fetchall()
     
     if not rows:
         return 0, 'none'
@@ -105,239 +103,273 @@ def get_current_streak(player_id, conn):
     return count, streak_type
 
 def process_match_elo(conn, match_id, team_a_ids, team_b_ids, score_a, score_b, sun):
-    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-    elo_a_sum, elo_b_sum = 0, 0
-    
-    for p_id in team_a_ids:
-        cur.execute('SELECT elo FROM players WHERE id = %s', (p_id,))
-        elo_a_sum += cur.fetchone()['elo']
-    for p_id in team_b_ids:
-        cur.execute('SELECT elo FROM players WHERE id = %s', (p_id,))
-        elo_b_sum += cur.fetchone()['elo']
+    """Procesa el cálculo de ELO aplicando fórmula sigmoide, placements personalizadas y multiplicadores dinámicos"""
+    with conn.cursor() as cur:
+        elo_a_sum, elo_b_sum = 0, 0
         
-    count_a = len(team_a_ids)
-    count_b = len(team_b_ids)
-    avg_a = elo_a_sum / count_a
-    avg_b = elo_b_sum / count_b
-    
-    adj_a = 0
-    adj_b = 0
-    if count_a != count_b:
-        ratio_a = count_a / (count_a + count_b)
-        ratio_b = count_b / (count_a + count_b)
-        adj_a += (ratio_a - 0.5) * 400
-        adj_b += (ratio_b - 0.5) * 400
-
-    if sun == 'A':
-        adj_a += 50
-    elif sun == 'B':
-        adj_b += 50
-        
-    avg_a_adjusted = avg_a + adj_a
-    avg_b_adjusted = avg_b + adj_b
-
-    actual_a = 1 if score_a > score_b else 0
-    actual_b = 1 if score_b > score_a else 0
-    
-    score_diff = abs(score_a - score_b)
-    if score_diff <= 2:
-        margin_multiplier = 0.75
-    elif score_diff <= 4:
-        margin_multiplier = 1.00
-    elif score_diff <= 6:
-        margin_multiplier = 1.15
-    else:
-        margin_multiplier = 1.30
-
-    disparidad = abs(count_a - count_b)
-    disparidad_mult_a = 1.0
-    disparidad_mult_b = 1.0
-    
-    if disparidad > 0:
-        factor_escala = 0.25 * disparidad 
-        if count_a > count_b:
-            if actual_a == 1: 
-                disparidad_mult_a = max(0.5, 1.0 - factor_escala)
-            else:             
-                disparidad_mult_a = 1.0 + factor_escala
-            if actual_b == 1: 
-                disparidad_mult_b = 1.0 + factor_escala
-            else:             
-                disparidad_mult_b = max(0.5, 1.0 - factor_escala)
-        elif count_b > count_a:
-            if actual_b == 1: 
-                disparidad_mult_b = max(0.5, 1.0 - factor_escala)
-            else:             
-                disparidad_mult_b = 1.0 + factor_escala
-            if actual_a == 1: 
-                disparidad_mult_a = 1.0 + factor_escala
-            else:             
-                disparidad_mult_a = max(0.5, 1.0 - factor_escala)
-
-    for p_id in team_a_ids:
-        cur.execute('SELECT elo FROM players WHERE id = %s', (p_id,))
-        p_elo = cur.fetchone()['elo']
-        player_elo_adjusted = p_elo + adj_a
-        
-        expected_player_a = 1 / (1 + 10 ** ((avg_b_adjusted - player_elo_adjusted) / 400))
-        change_base_player_a = actual_a - 0.85 * expected_player_a
-        
-        cur.execute('SELECT COUNT(*) as count FROM match_players WHERE player_id = %s', (p_id,))
-        games_played = cur.fetchone()['count']
-        k_factor = 52 if games_played < 5 else 26
-        
-        st_count, st_type = get_current_streak(p_id, conn)
-        
-        final_change = change_base_player_a * k_factor
-        final_change = final_change * margin_multiplier * disparidad_mult_a
-        
-        if final_change > 0 and st_type == 'win':
-            final_change += (st_count * 2)
-        elif final_change < 0 and st_type == 'loss':
-            final_change -= (st_count * 2)
+        for p_id in team_a_ids:
+            cur.execute('SELECT elo FROM players WHERE id = %s', (p_id,))
+            elo_a_sum += cur.fetchone()['elo']
+        for p_id in team_b_ids:
+            cur.execute('SELECT elo FROM players WHERE id = %s', (p_id,))
+            elo_b_sum += cur.fetchone()['elo']
             
-        final_change = int(round(final_change))
+        count_a = len(team_a_ids)
+        count_b = len(team_b_ids)
+        avg_a = elo_a_sum / count_a
+        avg_b = elo_b_sum / count_b
         
-        if games_played >= 5:
-            if final_change > 60: final_change = 60
-            elif final_change < -60: final_change = -60
-        
-        cur.execute('INSERT INTO match_players (match_id, player_id, team, elo_change) VALUES (%s, %s, %s, %s)', (match_id, p_id, 'A', final_change))
-        cur.execute('UPDATE players SET elo = elo + %s WHERE id = %s', (final_change, p_id))
-        
-        cur.execute('SELECT elo FROM players WHERE id = %s', (p_id,))
-        new_elo = cur.fetchone()['elo']
-        cur.execute('INSERT INTO elo_history (player_id, elo_snapshot) VALUES (%s, %s)', (p_id, new_elo))
-        
-    for p_id in team_b_ids:
-        cur.execute('SELECT elo FROM players WHERE id = %s', (p_id,))
-        p_elo = cur.fetchone()['elo']
-        player_elo_adjusted = p_elo + adj_b
-        
-        expected_player_b = 1 / (1 + 10 ** ((avg_a_adjusted - player_elo_adjusted) / 400))
-        change_base_player_b = actual_b - 0.85 * expected_player_b
-        
-        cur.execute('SELECT COUNT(*) as count FROM match_players WHERE player_id = %s', (p_id,))
-        games_played = cur.fetchone()['count']
-        k_factor = 52 if games_played < 5 else 26
-        
-        st_count, st_type = get_current_streak(p_id, conn)
-        
-        final_change = change_base_player_b * k_factor
-        final_change = final_change * margin_multiplier * disparidad_mult_b
-        
-        if final_change > 0 and st_type == 'win':
-            final_change += (st_count * 2)
-        elif final_change < 0 and st_type == 'loss':
-            final_change -= (st_count * 2)
+        adj_a = 0
+        adj_b = 0
+        if count_a != count_b:
+            ratio_a = count_a / (count_a + count_b)
+            ratio_b = count_b / (count_a + count_b)
+            adj_a += (ratio_a - 0.5) * 400
+            adj_b += (ratio_b - 0.5) * 400
+
+        if sun == 'A':
+            adj_a += 50
+        elif sun == 'B':
+            adj_b += 50
             
-        final_change = int(round(final_change))
+        avg_a_adjusted = avg_a + adj_a
+        avg_b_adjusted = avg_b + adj_b
+
+        actual_a = 1 if score_a > score_b else 0
+        actual_b = 1 if score_b > score_a else 0
         
-        if games_played >= 5:
-            if final_change > 60: final_change = 60
-            elif final_change < -60: final_change = -60
+        # Métrica 1: Margen de Victoria
+        score_diff = abs(score_a - score_b)
+        if score_diff <= 2:
+            margin_multiplier = 0.75
+        elif score_diff <= 4:
+            margin_multiplier = 1.00
+        elif score_diff <= 6:
+            margin_multiplier = 1.15
+        else:
+            margin_multiplier = 1.30
+
+        # Métrica 2: Disparidad de jugadores
+        disparidad = abs(count_a - count_b)
+        disparidad_mult_a = 1.0
+        disparidad_mult_b = 1.0
         
-        cur.execute('INSERT INTO match_players (match_id, player_id, team, elo_change) VALUES (%s, %s, %s, %s)', (match_id, p_id, 'B', final_change))
-        cur.execute('UPDATE players SET elo = elo + %s WHERE id = %s', (final_change, p_id))
-        
-        cur.execute('SELECT elo FROM players WHERE id = %s', (p_id,))
-        new_elo = cur.fetchone()['elo']
-        cur.execute('INSERT INTO elo_history (player_id, elo_snapshot) VALUES (%s, %s)', (p_id, new_elo))
-        
-    cur.close()
+        if disparidad > 0:
+            factor_escala = 0.25 * disparidad 
+            if count_a > count_b:
+                if actual_a == 1: 
+                    disparidad_mult_a = max(0.5, 1.0 - factor_escala)
+                else:             
+                    disparidad_mult_a = 1.0 + factor_escala
+                if actual_b == 1: 
+                    disparidad_mult_b = 1.0 + factor_escala
+                else:             
+                    disparidad_mult_b = max(0.5, 1.0 - factor_escala)
+            elif count_b > count_a:
+                if actual_b == 1: 
+                    disparidad_mult_b = max(0.5, 1.0 - factor_escala)
+                else:             
+                    disparidad_mult_b = 1.0 + factor_escala
+                if actual_a == 1: 
+                    disparidad_mult_a = 1.0 + factor_escala
+                else:             
+                    disparidad_mult_a = max(0.5, 1.0 - factor_escala)
+
+        # Usamos una K base estándar para empujar la fórmula. Las variaciones locas las dan los multiplicadores.
+        BASE_K = 32
+
+        # Procesar Equipo A
+        for p_id in team_a_ids:
+            cur.execute('SELECT elo FROM players WHERE id = %s', (p_id,))
+            p_elo = cur.fetchone()['elo']
+            player_elo_adjusted = p_elo + adj_a
+            
+            expected_player_a = 1 / (1 + 10 ** ((avg_b_adjusted - player_elo_adjusted) / 400))
+            change_base_player_a = actual_a - expected_player_a
+            
+            cur.execute('SELECT COUNT(*) as count FROM match_players WHERE player_id = %s', (p_id,))
+            games_played = cur.fetchone()['count']
+            
+            # PLACEMENTS MULTIPLIERS
+            if games_played == 0:
+                placement_mult = 5.0
+            elif games_played == 1:
+                placement_mult = 2.0
+            elif games_played == 2:
+                placement_mult = 1.35
+            elif games_played == 3:
+                placement_mult = 1.25
+            elif games_played == 4:
+                placement_mult = 1.15
+            else:
+                placement_mult = 1.0
+                
+            st_count, st_type = get_current_streak(p_id, conn)
+            is_win = (actual_a == 1)
+            
+            streak_mult = 1.0
+            # RACHAS EVOLUTIVAS (Solo fuera de Placements)
+            if games_played >= 5:
+                # Calculamos si este partido continúa la racha existente
+                if (is_win and st_type == 'win') or (not is_win and st_type == 'loss'):
+                    current_streak = st_count + 1
+                else:
+                    current_streak = 1
+                
+                # Multiplicador progresivo a partir de 3
+                if current_streak >= 3:
+                    streak_mult = 1.0 + (current_streak - 2) * 0.1
+
+            # Calcular cambio final sin límites superiores o inferiores
+            final_change = BASE_K * change_base_player_a * margin_multiplier * disparidad_mult_a * placement_mult * streak_mult
+            final_change = int(round(final_change))
+            
+            cur.execute('INSERT INTO match_players (match_id, player_id, team, elo_change) VALUES (%s, %s, %s, %s)', (match_id, p_id, 'A', final_change))
+            cur.execute('UPDATE players SET elo = elo + %s WHERE id = %s', (final_change, p_id))
+            
+            cur.execute('SELECT elo FROM players WHERE id = %s', (p_id,))
+            new_elo = cur.fetchone()['elo']
+            cur.execute('INSERT INTO elo_history (player_id, elo_snapshot) VALUES (%s, %s)', (p_id, new_elo))
+            
+        # Procesar Equipo B
+        for p_id in team_b_ids:
+            cur.execute('SELECT elo FROM players WHERE id = %s', (p_id,))
+            p_elo = cur.fetchone()['elo']
+            player_elo_adjusted = p_elo + adj_b
+            
+            expected_player_b = 1 / (1 + 10 ** ((avg_a_adjusted - player_elo_adjusted) / 400))
+            change_base_player_b = actual_b - expected_player_b
+            
+            cur.execute('SELECT COUNT(*) as count FROM match_players WHERE player_id = %s', (p_id,))
+            games_played = cur.fetchone()['count']
+            
+            # PLACEMENTS MULTIPLIERS
+            if games_played == 0:
+                placement_mult = 5.0
+            elif games_played == 1:
+                placement_mult = 2.0
+            elif games_played == 2:
+                placement_mult = 1.35
+            elif games_played == 3:
+                placement_mult = 1.25
+            elif games_played == 4:
+                placement_mult = 1.15
+            else:
+                placement_mult = 1.0
+                
+            st_count, st_type = get_current_streak(p_id, conn)
+            is_win = (actual_b == 1)
+            
+            streak_mult = 1.0
+            # RACHAS EVOLUTIVAS (Solo fuera de Placements)
+            if games_played >= 5:
+                if (is_win and st_type == 'win') or (not is_win and st_type == 'loss'):
+                    current_streak = st_count + 1
+                else:
+                    current_streak = 1
+                
+                if current_streak >= 3:
+                    streak_mult = 1.0 + (current_streak - 2) * 0.1
+
+            # Calcular cambio final sin límites superiores o inferiores
+            final_change = BASE_K * change_base_player_b * margin_multiplier * disparidad_mult_b * placement_mult * streak_mult
+            final_change = int(round(final_change))
+            
+            cur.execute('INSERT INTO match_players (match_id, player_id, team, elo_change) VALUES (%s, %s, %s, %s)', (match_id, p_id, 'B', final_change))
+            cur.execute('UPDATE players SET elo = elo + %s WHERE id = %s', (final_change, p_id))
+            
+            cur.execute('SELECT elo FROM players WHERE id = %s', (p_id,))
+            new_elo = cur.fetchone()['elo']
+            cur.execute('INSERT INTO elo_history (player_id, elo_snapshot) VALUES (%s, %s)', (p_id, new_elo))
 
 def recalculate_all_elos(conn):
-    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-    cur.execute('SELECT * FROM matches ORDER BY date ASC, id ASC')
-    db_matches = cur.fetchall()
-    
-    full_history = []
-    for m in db_matches:
-        cur.execute('SELECT player_id, team FROM match_players WHERE match_id = %s', (m['id'],))
-        players = cur.fetchall()
-        full_history.append({
-            'id': m['id'],
-            'score_a': m['score_a'],
-            'score_b': m['score_b'],
-            'sun_advantage': m['sun_advantage'],
-            'date': m['date'],
-            'players': [{'player_id': p['player_id'], 'team': p['team']} for p in players]
-        })
-    
-    cur.execute('DELETE FROM elo_history')
-    cur.execute('DELETE FROM match_players')
-    cur.execute('DELETE FROM matches')
-    cur.execute('UPDATE players SET elo = 1200')
-    
-    cur.execute("SELECT id FROM players")
-    existing_players = cur.fetchall()
-    for p in existing_players:
-        cur.execute("INSERT INTO elo_history (player_id, elo_snapshot) VALUES (%s, 1200)", (p['id'],))
+    """Reconstruye todo el historial de ELOs secuencialmente"""
+    with conn.cursor() as cur:
+        cur.execute('SELECT * FROM matches ORDER BY date ASC, id ASC')
+        db_matches = cur.fetchall()
+        full_history = []
+        for m in db_matches:
+            cur.execute('SELECT player_id, team FROM match_players WHERE match_id = %s', (m['id'],))
+            players = cur.fetchall()
+            full_history.append({
+                'id': m['id'],
+                'score_a': m['score_a'],
+                'score_b': m['score_b'],
+                'sun_advantage': m['sun_advantage'],
+                'date': m['date'],
+                'players': [{'player_id': p['player_id'], 'team': p['team']} for p in players]
+            })
         
-    for m in full_history:
-        team_a_ids = [p['player_id'] for p in m['players'] if p['team'] == 'A']
-        team_b_ids = [p['player_id'] for p in m['players'] if p['team'] == 'B']
+        cur.execute('DELETE FROM elo_history')
+        cur.execute('DELETE FROM match_players')
+        cur.execute('DELETE FROM matches')
+        cur.execute('UPDATE players SET elo = 1200')
         
-        if team_a_ids and team_b_ids:
-            cur.execute('INSERT INTO matches (id, score_a, score_b, sun_advantage, date) VALUES (%s, %s, %s, %s, %s)', 
-                         (m['id'], m['score_a'], m['score_b'], m['sun_advantage'], m['date']))
-            process_match_elo(conn, m['id'], team_a_ids, team_b_ids, m['score_a'], m['score_b'], m['sun_advantage'])
-    cur.close()
+        cur.execute("SELECT id FROM players")
+        existing_players = cur.fetchall()
+        for p in existing_players:
+            cur.execute("INSERT INTO elo_history (player_id, elo_snapshot) VALUES (%s, 1200)", (p['id'],))
+            
+        for m in full_history:
+            team_a_ids = [p['player_id'] for p in m['players'] if p['team'] == 'A']
+            team_b_ids = [p['player_id'] for p in m['players'] if p['team'] == 'B']
+            
+            if team_a_ids and team_b_ids:
+                cur.execute('INSERT INTO matches (id, score_a, score_b, sun_advantage, date) VALUES (%s, %s, %s, %s, %s)', 
+                             (m['id'], m['score_a'], m['score_b'], m['sun_advantage'], m['date']))
+                process_match_elo(conn, m['id'], team_a_ids, team_b_ids, m['score_a'], m['score_b'], m['sun_advantage'])
 
 def get_player_stats(player_id):
     conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-    
-    cur.execute('''
-        SELECT m.id, m.score_a, m.score_b, mp.team 
-        FROM match_players mp
-        JOIN matches m ON mp.match_id = m.id
-        WHERE mp.player_id = %s
-        ORDER BY m.date DESC, m.id DESC
-    ''', (player_id,))
-    matches = cur.fetchall()
-    
-    total_matches = len(matches)
-    wins = 0
-    teammates_games = {}
-    
-    for m in matches:
-        is_team_a = m['team'] == 'A'
-        won = (is_team_a and m['score_a'] > m['score_b']) or (not is_team_a and m['score_b'] > m['score_a'])
-        if won:
-            wins += 1
-        
+    with conn.cursor() as cur:
         cur.execute('''
-            SELECT player_id FROM match_players 
-            WHERE match_id = %s AND team = %s AND player_id != %s
-        ''', (m['id'], m['team'], player_id))
-        peers = cur.fetchall()
+            SELECT m.id, m.score_a, m.score_b, mp.team 
+            FROM match_players mp
+            JOIN matches m ON mp.match_id = m.id
+            WHERE mp.player_id = %s
+            ORDER BY m.date DESC, m.id DESC
+        ''', (player_id,))
+        matches = cur.fetchall()
         
-        for p in peers:
-            p_id = p['player_id']
-            if p_id not in teammates_games:
-                teammates_games[p_id] = [0, 0]
-            teammates_games[p_id][0] += 1
+        total_matches = len(matches)
+        wins = 0
+        teammates_games = {}
+        
+        for m in matches:
+            is_team_a = m['team'] == 'A'
+            won = (is_team_a and m['score_a'] > m['score_b']) or (not is_team_a and m['score_b'] > m['score_a'])
             if won:
-                teammates_games[p_id][1] += 1
+                wins += 1
+            
+            cur.execute('''
+                SELECT player_id FROM match_players 
+                WHERE match_id = %s AND team = %s AND player_id != %s
+            ''', (m['id'], m['team'], player_id))
+            peers = cur.fetchall()
+            
+            for p in peers:
+                p_id = p['player_id']
+                if p_id not in teammates_games:
+                    teammates_games[p_id] = [0, 0]
+                teammates_games[p_id][0] += 1
+                if won:
+                    teammates_games[p_id][1] += 1
 
-    winrate = round((wins / total_matches) * 100) if total_matches > 0 else 0
+        winrate = round((wins / total_matches) * 100) if total_matches > 0 else 0
 
-    teammates_summary = []
-    for t_id, counts in teammates_games.items():
-        cur.execute('SELECT name FROM players WHERE id = %s', (t_id,))
-        p_name = cur.fetchone()['name']
-        rate = round((counts[1] / counts[0]) * 100)
-        teammates_summary.append({"name": p_name, "played": counts[0], "winrate": rate})
+        teammates_summary = []
+        for t_id, counts in teammates_games.items():
+            cur.execute('SELECT name FROM players WHERE id = %s', (t_id,))
+            p_name = cur.fetchone()['name']
+            rate = round((counts[1] / counts[0]) * 100)
+            teammates_summary.append({"name": p_name, "played": counts[0], "winrate": rate})
 
-    st_count, st_type = get_current_streak(player_id, conn)
-    streak_emoji = ""
-    if st_count >= 3:
-        streak_emoji = f"🥵 {st_count}" if st_type == 'win' else f"🥶 {st_count}"
-
-    cur.close()
+        streak_emoji = ""
+        st_count, st_type = get_current_streak(player_id, conn)
+        if st_count >= 3:
+            streak_emoji = f"🥵 {st_count}" if st_type == 'win' else f"🥶 {st_count}"
+            
     conn.close()
-    
     return {
         "total": total_matches,
         "wins": wins,
@@ -353,97 +385,91 @@ def get_player_stats(player_id):
 @app.route('/')
 def index():
     conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-    
-    cur.execute("SELECT MAX(id) FROM matches")
-    last_match = cur.fetchone()
-    last_match_id = last_match[0] if last_match and last_match[0] else None
+    with conn.cursor() as cur:
+        cur.execute("SELECT MAX(id) FROM matches")
+        last_match = cur.fetchone()
+        last_match_id = last_match[0] if last_match and last_match[0] else None
 
-    cur.execute('SELECT * FROM players ORDER BY elo DESC, name ASC')
-    db_players = cur.fetchall()
-    
-    leaderboard = []
-    players_list = []
-    
-    for p in db_players:
-        players_list.append({"id": p['id'], "name": p['name']})
-        stats = get_player_stats(p['id'])
-        leaderboard.append({
-            "id": p['id'], "name": p['name'], "elo": round(p['elo']), "prev_elo": p['elo'], "trend_emoji": "➖", **stats
-        })
-        
-    if last_match_id and len(leaderboard) > 0:
-        cur.execute("SELECT player_id, elo_change FROM match_players WHERE match_id = %s", (last_match_id,))
-        changes_rows = cur.fetchall()
-        changes = {row['player_id']: row['elo_change'] for row in changes_rows}
-        
-        for p in leaderboard:
-            p['prev_elo'] = p['elo'] - changes.get(p['id'], 0.0)
+        cur.execute('SELECT * FROM players ORDER BY elo DESC, name ASC')
+        db_players = cur.fetchall()
+        leaderboard = []
+        players_list = []
+
+        for p in db_players:
+            players_list.append({"id": p['id'], "name": p['name']})
+            stats = get_player_stats(p['id'])
+            leaderboard.append({
+                "id": p['id'],
+                "name": p['name'],
+                "elo": round(p['elo']),
+                "prev_elo": p['elo'],
+                "trend_emoji": "➖",
+                **stats
+            })
+
+        if last_match_id and len(leaderboard) > 0:
+            cur.execute("SELECT player_id, elo_change FROM match_players WHERE match_id = %s", (last_match_id,))
+            changes_rows = cur.fetchall()
+            changes = {row['player_id']: row['elo_change'] for row in changes_rows}
+            for p in leaderboard:
+                p['prev_elo'] = p['elo'] - changes.get(p['id'], 0.0)
             
-        sorted_by_prev = sorted(leaderboard, key=lambda x: (-x['prev_elo'], x['name']))
-        prev_ranks = {p['id']: idx for idx, p in enumerate(sorted_by_prev)}
-        
-        for idx, p in enumerate(leaderboard):
-            prev_idx = prev_ranks[p['id']]
-            if idx < prev_idx:
-                p['trend_emoji'] = "🔺"
-            elif idx > prev_idx:
-                p['trend_emoji'] = "🔻"
-            else:
-                p['trend_emoji'] = "➖"
+            sorted_by_prev = sorted(leaderboard, key=lambda x: (-x['prev_elo'], x['name']))
+            prev_ranks = {p['id']: idx for idx, p in enumerate(sorted_by_prev)}
+            for idx, p in enumerate(leaderboard):
+                prev_idx = prev_ranks[p['id']]
+                if idx < prev_idx: p['trend_emoji'] = "🔺"
+                elif idx > prev_idx: p['trend_emoji'] = "🔻"
+                else: p['trend_emoji'] = "➖"
 
-    cur.execute('SELECT * FROM matches ORDER BY date DESC')
-    db_matches = cur.fetchall()
-    match_history = []
-    for m in db_matches:
-        cur.execute('SELECT p.name FROM players p JOIN match_players mp ON p.id = mp.player_id WHERE mp.match_id = %s AND mp.team = \'A\'', (m['id'],))
-        team_a_players = cur.fetchall()
-        cur.execute('SELECT p.name FROM players p JOIN match_players mp ON p.id = mp.player_id WHERE mp.match_id = %s AND mp.team = \'B\'', (m['id'],))
-        team_b_players = cur.fetchall()
-        
-        sun_emoji = "-"
-        if m['sun_advantage'] == 'A':
-            sun_emoji = "☀️ Sol en contra: Equipo B"
-        elif m['sun_advantage'] == 'B':
-            sun_emoji = "☀️ Sol en contra: Equipo A"
-
-        date_str = m['date'].strftime('%Y-%m-%d') if hasattr(m['date'], 'strftime') else str(m['date']).split()[0]
-
-        match_history.append({
-            "id": m['id'],
-            "date": date_str,
-            "team_a": f"({len(team_a_players)}) " + ", ".join([p['name'] for p in team_a_players]),
-            "team_b": f"({len(team_b_players)}) " + ", ".join([p['name'] for p in team_b_players]),
-            "score_a": m['score_a'],
-            "score_b": m['score_b'],
-            "sun": sun_emoji
-        })
-        
-    cur.close()
+        cur.execute('SELECT * FROM matches ORDER BY date DESC')
+        db_matches = cur.fetchall()
+        match_history = []
+        for m in db_matches:
+            cur.execute("SELECT p.name FROM players p JOIN match_players mp ON p.id = mp.player_id WHERE mp.match_id = %s AND mp.team = 'A'", (m['id'],))
+            team_a_players = cur.fetchall()
+            
+            cur.execute("SELECT p.name FROM players p JOIN match_players mp ON p.id = mp.player_id WHERE mp.match_id = %s AND mp.team = 'B'", (m['id'],))
+            team_b_players = cur.fetchall()
+            
+            sun_emoji = "-"
+            if m['sun_advantage'] == 'A':
+                sun_emoji = "☀️ Sol en contra: Equipo B"
+            elif m['sun_advantage'] == 'B':
+                sun_emoji = "☀️ Sol en contra: Equipo A"
+                
+            match_history.append({
+                "id": m['id'],
+                "date": str(m['date']).split()[0],
+                "team_a": f"({len(team_a_players)}) " + ", ".join([p['name'] for p in team_a_players]),
+                "team_b": f"({len(team_b_players)}) " + ", ".join([p['name'] for p in team_b_players]),
+                "score_a": m['score_a'],
+                "score_b": m['score_b'],
+                "sun": sun_emoji
+            })
+            
     conn.close()
     return render_template_string(HTML_TEMPLATE, leaderboard=leaderboard, players=players_list, history=match_history)
 
 @app.route('/match_detail/<int:match_id>')
 def match_detail(match_id):
     conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-    
-    cur.execute('SELECT * FROM matches WHERE id = %s', (match_id,))
-    match = cur.fetchone()
-    if not match:
-        cur.close()
-        conn.close()
-        return jsonify({"error": "Partido no encontrado"}), 404
+    with conn.cursor() as cur:
+        cur.execute('SELECT * FROM matches WHERE id = %s', (match_id,))
+        match = cur.fetchone()
+        if not match:
+            conn.close()
+            return jsonify({"error": "Partido no encontrado"}), 404
+            
+        cur.execute('''
+            SELECT mp.player_id, mp.team, p.name, mp.elo_change,
+                   (1200 + COALESCE((SELECT SUM(mp2.elo_change) FROM match_players mp2 WHERE mp2.player_id = mp.player_id AND mp2.match_id < mp.match_id), 0)) AS elo_at_match
+            FROM match_players mp
+            JOIN players p ON mp.player_id = p.id
+            WHERE mp.match_id = %s
+        ''', (match_id,))
+        players_match = cur.fetchall()
         
-    cur.execute('''
-        SELECT mp.player_id, mp.team, p.name, mp.elo_change,
-               (1200 + COALESCE((SELECT SUM(mp2.elo_change) FROM match_players mp2 WHERE mp2.player_id = mp.player_id AND mp2.match_id < mp.match_id), 0)) AS elo_at_match
-        FROM match_players mp
-        JOIN players p ON mp.player_id = p.id
-        WHERE mp.match_id = %s
-    ''', (match_id,))
-    players_match = cur.fetchall()
-    
     team_a = []
     team_b = []
     sum_elo_a = 0
@@ -465,16 +491,13 @@ def match_detail(match_id):
     avg_elo_a = round(sum_elo_a / len(team_a)) if team_a else 1200
     avg_elo_b = round(sum_elo_b / len(team_b)) if team_b else 1200
     
-    date_str = match['date'].strftime('%Y-%m-%d') if hasattr(match['date'], 'strftime') else str(match['date']).split()[0]
-    
-    cur.close()
     conn.close()
     return jsonify({
         "id": match['id'],
         "score_a": match['score_a'],
         "score_b": match['score_b'],
         "sun_advantage": match['sun_advantage'],
-        "date": date_str,
+        "date": str(match['date']).split()[0],
         "team_a": team_a,
         "team_b": team_b,
         "avg_elo_a": avg_elo_a,
@@ -484,46 +507,41 @@ def match_detail(match_id):
 @app.route('/player_profile/<int:player_id>')
 def player_profile(player_id):
     conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-    
-    cur.execute('SELECT * FROM players WHERE id = %s', (player_id,))
-    player = cur.fetchone()
-    if not player:
-        cur.close()
-        conn.close()
-        return jsonify({"error": "Jugador no encontrado"}), 404
+    with conn.cursor() as cur:
+        cur.execute('SELECT * FROM players WHERE id = %s', (player_id,))
+        player = cur.fetchone()
+        if not player:
+            conn.close()
+            return jsonify({"error": "Jugador no encontrado"}), 404
+            
+        stats = get_player_stats(player_id)
         
-    stats = get_player_stats(player_id)
-    
-    cur.execute('''
-        SELECT m.id, m.date, m.score_a, m.score_b, mp.team, mp.elo_change 
-        FROM match_players mp
-        JOIN matches m ON mp.match_id = m.id
-        WHERE mp.player_id = %s
-        ORDER BY m.date DESC
-    ''', (player_id,))
-    raw_history = cur.fetchall()
-    
-    match_list = []
-    for rh in raw_history:
-        is_a = rh['team'] == 'A'
-        won = (is_a and rh['score_a'] > rh['score_b']) or (not is_a and rh['score_b'] > rh['score_a'])
-        date_str = rh['date'].strftime('%Y-%m-%d') if hasattr(rh['date'], 'strftime') else str(rh['date']).split()[0]
+        cur.execute('''
+            SELECT m.id, m.date, m.score_a, m.score_b, mp.team, mp.elo_change 
+            FROM match_players mp
+            JOIN matches m ON mp.match_id = m.id
+            WHERE mp.player_id = %s
+            ORDER BY m.date DESC, m.id DESC
+        ''', (player_id,))
+        raw_history = cur.fetchall()
         
-        match_list.append({
-            "id": rh['id'],
-            "date": date_str,
-            "score": f"{rh['score_a']} - {rh['score_b']}",
-            "team": rh['team'],
-            "result": "Victoria" if won else "Derrota",
-            "change": int(rh['elo_change']) if rh['elo_change'] is not None else 0
-        })
+        match_list = []
+        for rh in raw_history:
+            is_a = rh['team'] == 'A'
+            won = (is_a and rh['score_a'] > rh['score_b']) or (not is_a and rh['score_b'] > rh['score_a'])
+            match_list.append({
+                "id": rh['id'],
+                "date": str(rh['date']).split()[0],
+                "score": f"{rh['score_a']} - {rh['score_b']}",
+                "team": rh['team'],
+                "result": "Victoria" if won else "Derrota",
+                "change": int(rh['elo_change']) if rh['elo_change'] is not None else 0
+            })
 
-    cur.execute('SELECT elo_snapshot FROM elo_history WHERE player_id = %s ORDER BY date ASC', (player_id,))
-    elo_snaps = cur.fetchall()
-    chart_data = [row['elo_snapshot'] for row in elo_snaps]
+        cur.execute('SELECT elo_snapshot FROM elo_history WHERE player_id = %s ORDER BY date ASC, id ASC', (player_id,))
+        elo_snaps = cur.fetchall()
+        chart_data = [1200] + [row['elo_snapshot'] for row in elo_snaps]
 
-    cur.close()
     conn.close()
     return jsonify({
         "name": player['name'],
@@ -537,17 +555,17 @@ def player_profile(player_id):
 def add_player():
     name = request.form.get('name').strip()
     if name:
-        conn = get_db_connection()
-        cur = conn.cursor()
         try:
-            cur.execute('INSERT INTO players (name) VALUES (%s) RETURNING id', (name,))
-            player_id = cur.fetchone()[0]
-            cur.execute('INSERT INTO elo_history (player_id, elo_snapshot) VALUES (%s, 1200)', (player_id,))
+            conn = get_db_connection()
+            with conn.cursor() as cur:
+                cur.execute('INSERT INTO players (name) VALUES (%s) RETURNING id', (name,))
+                player_id = cur.fetchone()[0]
+                cur.execute('INSERT INTO elo_history (player_id, elo_snapshot) VALUES (%s, 1200)', (player_id,))
             conn.commit()
         except psycopg2.IntegrityError:
             conn.rollback()
+            pass
         finally:
-            cur.close()
             conn.close()
     return redirect(url_for('index'))
 
@@ -556,15 +574,15 @@ def edit_player():
     player_id = request.form.get('player_id')
     new_name = request.form.get('new_name').strip()
     if player_id and new_name:
-        conn = get_db_connection()
-        cur = conn.cursor()
         try:
-            cur.execute('UPDATE players SET name = %s WHERE id = %s', (new_name, player_id))
+            conn = get_db_connection()
+            with conn.cursor() as cur:
+                cur.execute('UPDATE players SET name = %s WHERE id = %s', (new_name, player_id))
             conn.commit()
         except psycopg2.IntegrityError:
             conn.rollback()
+            pass
         finally:
-            cur.close()
             conn.close()
     return redirect(url_for('index'))
 
@@ -590,14 +608,13 @@ def add_match():
     
     if team_a_ids and team_b_ids:
         conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute('INSERT INTO matches (score_a, score_b, sun_advantage) VALUES (%s, %s, %s) RETURNING id', (score_a, score_b, sun))
-        match_id = cur.fetchone()[0]
+        with conn.cursor() as cur:
+            cur.execute('INSERT INTO matches (score_a, score_b, sun_advantage) VALUES (%s, %s, %s) RETURNING id', (score_a, score_b, sun))
+            match_id = cur.fetchone()[0]
         
         process_match_elo(conn, match_id, team_a_ids, team_b_ids, score_a, score_b, sun)
         
         conn.commit()
-        cur.close()
         conn.close()
         
     return redirect(url_for('index'))
@@ -605,12 +622,11 @@ def add_match():
 @app.route('/delete_match/<int:match_id>', methods=['POST'])
 def delete_match(match_id):
     conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute('DELETE FROM matches WHERE id = %s', (match_id,))
-    cur.execute('DELETE FROM match_players WHERE match_id = %s', (match_id,))
+    with conn.cursor() as cur:
+        cur.execute('DELETE FROM matches WHERE id = %s', (match_id,))
+        cur.execute('DELETE FROM match_players WHERE match_id = %s', (match_id,))
     recalculate_all_elos(conn)
     conn.commit()
-    cur.close()
     conn.close()
     return redirect(url_for('index'))
 
@@ -629,114 +645,75 @@ def edit_match(match_id):
         sun = 'None'
         
     conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute('UPDATE matches SET score_a = %s, score_b = %s, sun_advantage = %s WHERE id = %s', 
-                 (score_a, score_b, sun, match_id))
+    with conn.cursor() as cur:
+        cur.execute('UPDATE matches SET score_a = %s, score_b = %s, sun_advantage = %s WHERE id = %s', 
+                     (score_a, score_b, sun, match_id))
     recalculate_all_elos(conn)
     conn.commit()
-    cur.close()
     conn.close()
     return redirect(url_for('index'))
 
+# ---------------------------------------------------------
+# RUTAS DE RESPALDO Y RESTAURACIÓN (MIGRACIÓN MENSUAL)
+# ---------------------------------------------------------
+@app.route('/backup-db')
+def backup_db():
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute('SELECT * FROM players')
+            players = [dict(row) for row in cur.fetchall()]
+            cur.execute('SELECT * FROM matches')
+            matches = [dict(row) for row in cur.fetchall()]
+            cur.execute('SELECT * FROM match_players')
+            match_players = [dict(row) for row in cur.fetchall()]
+            try:
+                cur.execute('SELECT * FROM elo_history')
+                elo_history = [dict(row) for row in cur.fetchall()]
+            except:
+                elo_history = []
+            
+    backup_data = {
+        "players": players,
+        "matches": matches,
+        "match_players": match_players,
+        "elo_history": elo_history
+    }
+    return Response(
+        json.dumps(backup_data, default=str),
+        mimetype="application/json",
+        headers={"Content-Disposition": "attachment;filename=voley_db_backup.json"}
+    )
 
-# =========================================================
-# RUTAS DE BACKUP (JSON MIGRATION PLAN)
-# =========================================================
-@app.route('/download_backup')
-def download_backup():
+@app.route('/restore-db', methods=['POST'])
+def restore_db():
+    if 'file' not in request.files: 
+        return "<script>alert('No se ha seleccionado ningún archivo'); window.history.back();</script>", 400
+    file = request.files['file']
+    if file.filename == '': 
+        return "<script>alert('Archivo sin nombre válido'); window.history.back();</script>", 400
     try:
-        conn = get_db_connection()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-        
-        cur.execute("SELECT id, name, elo FROM players")
-        players = [dict(row) for row in cur.fetchall()]
-        
-        cur.execute("SELECT id, score_a, score_b, sun_advantage, date FROM matches")
-        matches = []
-        for row in cur.fetchall():
-            d = dict(row)
-            if d.get('date') and hasattr(d['date'], 'isoformat'):
-                d['date'] = d['date'].isoformat()
-            else:
-                d['date'] = str(d['date'])
-            matches.append(d)
-            
-        cur.execute("SELECT id, player_id, elo_snapshot, date FROM elo_history")
-        elo_history = []
-        for row in cur.fetchall():
-            d = dict(row)
-            if d.get('date') and hasattr(d['date'], 'isoformat'):
-                d['date'] = d['date'].isoformat()
-            else:
-                d['date'] = str(d['date'])
-            elo_history.append(d)
-            
-        cur.execute("SELECT match_id, player_id, team, elo_change FROM match_players")
-        match_players = [dict(row) for row in cur.fetchall()]
-        
-        backup_data = {
-            "players": players,
-            "matches": matches,
-            "match_players": match_players,
-            "elo_history": elo_history
-        }
-        
-        cur.close()
-        conn.close()
-        
-        json_data = json.dumps(backup_data, indent=4)
-        return Response(
-            json_data,
-            mimetype="application/json",
-            headers={"Content-disposition": "attachment; filename=voley_db_backup.json"}
-        )
+        data = json.load(file)
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute('TRUNCATE TABLE match_players, elo_history, matches, players RESTART IDENTITY CASCADE')
+                for p in data.get('players', []):
+                    cur.execute('INSERT INTO players (id, name, elo) VALUES (%s, %s, %s)', (p['id'], p['name'], p['elo']))
+                for m in data.get('matches', []):
+                    cur.execute('INSERT INTO matches (id, score_a, score_b, sun_advantage, date) VALUES (%s, %s, %s, %s, %s)', 
+                                 (m['id'], m['score_a'], m['score_b'], m['sun_advantage'], m['date']))
+                for mp in data.get('match_players', []):
+                    cur.execute('INSERT INTO match_players (match_id, player_id, team, elo_change) VALUES (%s, %s, %s, %s)', 
+                                 (mp['match_id'], mp['player_id'], mp['team'], mp['elo_change']))
+                for eh in data.get('elo_history', []):
+                    cur.execute('INSERT INTO elo_history (id, player_id, elo_snapshot, date) VALUES (%s, %s, %s, %s)', 
+                                 (eh['id'], eh['player_id'], eh['elo_snapshot'], eh.get('date')))
+                
+                cur.execute("SELECT setval('players_id_seq', COALESCE((SELECT MAX(id) FROM players), 1))")
+                cur.execute("SELECT setval('matches_id_seq', COALESCE((SELECT MAX(id) FROM matches), 1))")
+            conn.commit()
+        return '<script>alert("¡Base de datos restaurada con éxito total!"); window.location.href = "/";</script>'
     except Exception as e:
-        return f"Error al generar la copia de seguridad: {str(e)}", 500
-
-
-@app.route('/restore_backup', methods=['POST'])
-def restore_backup():
-    if 'backup_file' not in request.files:
-        return "No se ha subido ningún archivo.", 400
-        
-    file = request.files['backup_file']
-    if file.filename == '':
-        return "Archivo no válido.", 400
-        
-    try:
-        backup_data = json.load(file)
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
-        cur.execute("TRUNCATE match_players, elo_history, matches, players RESTART IDENTITY CASCADE;")
-        
-        for p in backup_data.get('players', []):
-            cur.execute("INSERT INTO players (id, name, elo) VALUES (%s, %s, %s)", (p['id'], p['name'], p['elo']))
-            
-        for m in backup_data.get('matches', []):
-            cur.execute("INSERT INTO matches (id, score_a, score_b, sun_advantage, date) VALUES (%s, %s, %s, %s, %s)", 
-                        (m['id'], m['score_a'], m['score_b'], m['sun_advantage'], m['date']))
-            
-        for mp in backup_data.get('match_players', []):
-            cur.execute("INSERT INTO match_players (match_id, player_id, team, elo_change) VALUES (%s, %s, %s, %s)", 
-                        (mp['match_id'], mp['player_id'], mp['team'], mp['elo_change']))
-            
-        for eh in backup_data.get('elo_history', []):
-            cur.execute("INSERT INTO elo_history (id, player_id, elo_snapshot, date) VALUES (%s, %s, %s, %s)", 
-                        (eh['id'], eh['player_id'], eh['elo_snapshot'], eh['date']))
-            
-        cur.execute("SELECT setval('players_id_seq', COALESCE((SELECT MAX(id) FROM players), 1))")
-        cur.execute("SELECT setval('matches_id_seq', COALESCE((SELECT MAX(id) FROM matches), 1))")
-        cur.execute("SELECT setval('elo_history_id_seq', COALESCE((SELECT MAX(id) FROM elo_history), 1))")
-        
-        conn.commit()
-        cur.close()
-        conn.close()
-        
-        return redirect(url_for('index'))
-    except Exception as e:
-        return f"Error al restaurar los datos: {str(e)}", 500
-
+        return f"Error crítico durante la restauración: {str(e)}", 500
 
 # ---------------------------------------------------------
 # 4. INTERFAZ EN HTML INTEGRADA
@@ -821,7 +798,7 @@ HTML_TEMPLATE = """
             <a onclick="showTab('ranking', this)" class="active-tab">🏆 Ránking y Métricas</a>
             <a onclick="showTab('add_match', this)">📝 Añadir Resultado</a>
             <a onclick="showTab('history', this)">📖 Historial de Partidos</a>
-            <a onclick="showTab('players', this)">👥 Gestión</a>
+            <a onclick="showTab('players', this)">👥 Gestión de Jugadores</a>
         </nav>
 
         <section id="ranking" class="tab-content active">
@@ -849,7 +826,7 @@ HTML_TEMPLATE = """
                                 <span class="streak-badge" style="margin: 0;">{{ p.streak_emoji }}</span>
                                 {% endif %}
                                 {% if p.total < 5 %}
-                                <span class="placement-badge">PLACEMENT {{p.total}}/5</span>
+                                <span class="placement-badge">PROBACIÓN {{p.total}}/5</span>
                                 {% endif %}
                             </td>
                             <td><strong>{{ p.elo }}</strong></td>
@@ -952,26 +929,20 @@ HTML_TEMPLATE = """
                     </form>
                 </article>
             </div>
-
-            <div style="margin: 30px auto 0 auto; padding: 20px; border: 1px solid #1095c1; border-radius: 8px; background-color: #f4fafd; font-family: sans-serif;">
-                <h3 style="color: #1095c1; margin-top: 0; font-size: 18px;">Gestión de Datos (Plan Gratuito Render)</h3>
-                <p style="font-size: 13px; color: #555; line-height: 1.4; margin-bottom: 15px;">
-                    Las bases de datos gratuitas vencen a los 30 días. Descarga tu copia de seguridad antes del <strong>7 de julio de 2026</strong>. Cuando crees una nueva base de datos el próximo mes, sube el archivo JSON aquí para restaurar todo el historial.
-                </p>
-                <div style="display: flex; flex-wrap: wrap; gap: 20px; align-items: center;">
-                    <a href="/download_backup" style="background-color: #1095c1; color: white; padding: 10px 18px; text-decoration: none; border-radius: 4px; font-weight: bold; font-size: 14px; display: inline-block;">
-                        📥 Descargar Copia Actual (JSON)
-                    </a>
-                    <form action="/restore_backup" method="POST" enctype="multipart/form-data" style="display: flex; align-items: center; gap: 10px; margin: 0;">
-                        <input type="file" id="backup_file" name="backup_file" accept=".json" required style="font-size: 13px; border: 1px dashed #1095c1; padding: 5px; border-radius: 4px; background: white;">
-                        <button type="submit" onclick="return confirm('¿Estás seguro? Esto reemplazará todos los datos de la base de datos actual.')" style="background-color: #e67e22; color: white; padding: 10px 15px; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; font-size: 14px; width: auto; margin:0;">
-                            📤 Restaurar Datos
-                        </button>
+            
+            <br>
+            <article>
+                <h3>💾 Copia de Seguridad y Migración Mensual</h3>
+                <p>Descarga tus datos en un archivo JSON antes de que caduque la base de datos gratuita de Render para restaurarla cómodamente cuando crees la nueva instancia el próximo mes.</p>
+                <div style="display: flex; gap: 20px; align-items: center; flex-wrap: wrap;">
+                    <a href="/backup-db" role="button" class="contrast" style="background-color: #2e7d32; border-color: #2e7d32; color: white; text-decoration: none;">📥 Descargar Copia de Seguridad (JSON)</a>
+                    <form action="/restore-db" method="POST" enctype="multipart/form-data" style="margin: 0; display: flex; gap: 10px; align-items: center; flex: 1;">
+                        <input type="file" name="file" accept=".json" required style="margin: 0;">
+                        <button type="submit" style="margin: 0; background-color: #ff9800; border-color: #ff9800; color: white; white-space: nowrap;">Subir y Restaurar Datos</button>
                     </form>
                 </div>
-            </div>
+            </article>
         </section>
-
     </main>
 
     <dialog id="profileModal">
@@ -1317,5 +1288,10 @@ HTML_TEMPLATE = """
 
 if __name__ == '__main__':
     init_db()
-    port = int(os.environ.get("PORT", 5000))
-    app.run(debug=True, host='0.0.0.0', port=port)
+    app.run(debug=True, host='0.0.0.0', port=5000)
+"""
+
+with open("app.py", "w", encoding="utf-8") as f:
+    f.write(code)
+
+print("File app.py written successfully.")}}
