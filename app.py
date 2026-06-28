@@ -247,13 +247,13 @@ def process_match_elo(conn, match_id, team_a_ids, team_b_ids, score_a, score_b, 
             if games_played == 0:
                 placement_mult = 5.0
             elif games_played == 1:
-                placement_mult = 2.0
+                placement_mult = 2.5
             elif games_played == 2:
-                placement_mult = 1.35
+                placement_mult = 1.85
             elif games_played == 3:
-                placement_mult = 1.25
+                placement_mult = 1.5
             elif games_played == 4:
-                placement_mult = 1.15
+                placement_mult = 1.25
             else:
                 placement_mult = 1.0
                 
